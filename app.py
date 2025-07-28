@@ -103,13 +103,13 @@ def get_company_profile_text():
     return profile_text
 
 try:
-    os.environ["AZURE_OPENAI_API_KEY"] = "DVXL9D3Arjt5dHYXWIrDw0D71pTHgUuKbDSrArAnIvLRtIsP6lVsJQQJ99BFACYeBjFXJ3w3AAABACOG6tV6"  
-    os.environ["AZURE_OPENAI_ENDPOINT"] = "https://ls-openai-prd-01.openai.azure.com/"  
-    os.environ["AZURE_OPENAI_API_VERSION"] = "2024-02-01"  
-    os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"] = "ls-gpt-4o-mini-06202025"  
-    os.environ["AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME"] = "text-embedding-ada-002"  
-except KeyError:
-    st.error("❌ Critical credentials not found. Please check your environment variables.")
+    os.environ["AZURE_OPENAI_API_KEY"] = st.secrets["AZURE_API_KEY"]
+    os.environ["AZURE_OPENAI_ENDPOINT"] = st.secrets["AZURE_ENDPOINT"]
+    os.environ["AZURE_OPENAI_API_VERSION"] = st.secrets["AZURE_API_VERSION"]
+    os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"] = st.secrets["AZURE_LLM_DEPLOYMENT"]
+    os.environ["AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME"] = st.secrets["AZURE_EMBEDDING_DEPLOYMENT"]
+except KeyError as e:
+    st.error(f"❌ A required secret is missing: {e}. Please configure your secrets in the app settings.")
     st.stop()
 
 # ---
