@@ -1,6 +1,8 @@
 streamlit
 pandas
-openai
-langchain==0.1.13
 fpdf
-email-validator
+langchain-openai
+langchain-community
+faiss-cpu
+openpyxl
+
