@@ -1,8 +1,12 @@
 streamlit
 pandas
-fpdf
-langchain-openai
-langchain-community
-faiss-cpu
 openpyxl
-XlsxWriter
+xlsxwriter
+langchain
+langchain-community
+langchain-openai
+faiss-cpu
+openai
+fpdf2
+fpdf
+tenacity
