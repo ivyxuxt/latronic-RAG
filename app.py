@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import tempfile
 import os
+import re
 from fpdf import FPDF
 import logging
 from langchain_community.document_loaders import CSVLoader
@@ -15,6 +16,8 @@ from langchain_core.documents import Document
 from io import BytesIO
 import datetime
 import ast
+from tenacity import retry, wait_random_exponential, stop_after_attempt
+import time
 
 # Logging configuration
 logging.basicConfig(level=logging.INFO)
@@ -48,7 +51,15 @@ def get_company_profile_text():
     company_info = {
         "company_name": "LaTronic Solutions",
         "company_description": "Global IT services company established in 2008, specializing in innovative, scalable, and customized technology solutions.",
-        "services": ["Program/Project Management", "Cloud Services", "System Integration", "Infrastructure Solutions"],
+        "services": [
+            "IT & Management Consulting Services",
+            "Cloud, Data Processing, and Hosting Solutions",
+            "Computer Systems Design, Integration, and Custom Programming",
+            "Computer Facilities Management",
+            "Technical and Scientific Consulting",
+            "IT Training Services",
+            "Employment Placement and Technology Staffing"
+        ],
         "mission": "To empower clients with the tools and expertise needed to navigate the complexities of today’s fast-evolving digital landscape.",
         "leadership": {"background": "Extensive experience in the field, with contracts from US government and private sectors."}
     }
@@ -166,25 +177,86 @@ def run_naics_pre_filter():
     
     st.session_state.naics_summary = "\n".join(summary_lines)
 
+def parse_markdown_table_to_df(markdown_text: str) -> pd.DataFrame:
+    """
+    Parses a Markdown table from the LLM's response into a pandas DataFrame.
+    """
+    # Find the table by looking for a header row containing the required columns.
+    match = re.search(r'\|.*Identifier.*\|', markdown_text)
+    if not match:
+        logging.warning("No Markdown table header found in the response.")
+        return pd.DataFrame()
+
+    # Isolate the table text from the rest of the response
+    table_text = markdown_text[match.start():]
+    lines = table_text.strip().split('\n')
+    
+    if len(lines) < 2:
+        return pd.DataFrame() # Not a valid table
+
+    # Extract header columns from the first line
+    header = [h.strip() for h in lines[0].strip('|').split('|')]
+    
+    # The third line and onwards contain the data
+    data = []
+    for line in lines[2:]:
+        # Ensure the line is a valid table row
+        if not line.strip().startswith('|') or not line.strip().endswith('|'):
+            continue
+        
+        cells = [c.strip() for c in line.strip('|').split('|')]
+        if len(cells) == len(header):
+            data.append(dict(zip(header, cells)))
+
+    if not data:
+        logging.warning("Markdown table was found, but no data rows could be parsed.")
+        return pd.DataFrame()
+
+    return pd.DataFrame(data)
+
+
+@retry(wait=wait_random_exponential(min=1, max=20), stop=stop_after_attempt(6))
+def create_embeddings_with_backoff(chunks, embeddings_model):
+    """Helper function to create embeddings with retry logic."""
+    return embeddings_model.embed_documents(chunks)
+
 def process_file_with_rag(file, file_type, user_prompt, output_format):
     with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as tmp:
         if file_type == "xlsx":
             pd.read_excel(file).to_csv(tmp.name, index=False)
         else:
-            tmp.seek(0)
+            # For CSV, we need to ensure it's read correctly and written back
+            # The original code had a potential issue here if the file wasn't seeked.
+            file.seek(0)
             tmp.write(file.read())
         
+        tmp.seek(0) # Ensure loader reads from the start
         loader = CSVLoader(file_path=tmp.name)
         documents = loader.load()
-    
+
     company_profile_doc = Document(page_content=get_company_profile_text(), metadata={"source": "Company Profile"})
     documents.append(company_profile_doc)
 
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=150)
     chunks = text_splitter.split_documents(documents)
-    
+
     embeddings = AzureOpenAIEmbeddings(azure_deployment=os.environ["AZURE_OPENAI_EMBEDDINGS_DEPLOYMENT_NAME"])
-    db = FAISS.from_documents(chunks, embeddings)
+    
+    batch_size = 16
+    all_embeddings = []
+    
+    st.info(f"Generating embeddings for {len(chunks)} text chunks...")
+    
+    for i in range(0, len(chunks), batch_size):
+        batch = chunks[i:i + batch_size]
+        batch_texts = [doc.page_content for doc in batch]
+        batch_embeddings = create_embeddings_with_backoff(batch_texts, embeddings)
+        all_embeddings.extend(batch_embeddings)
+        progress = (i + len(batch)) / len(chunks)
+        print(f"Processed batch {i//batch_size + 1}, progress: {progress:.2%}")
+
+    text_embedding_pairs = list(zip([doc.page_content for doc in chunks], all_embeddings))
+    db = FAISS.from_embeddings(text_embedding_pairs, embeddings)
 
     llm = AzureChatOpenAI(
         azure_deployment=os.environ["AZURE_OPENAI_CHAT_DEPLOYMENT_NAME"],
@@ -192,21 +264,28 @@ def process_file_with_rag(file, file_type, user_prompt, output_format):
         temperature=0.5,
     )
     
-
     prompt_template = ChatPromptTemplate.from_template(
         """You are an expert procurement analyst for LaTronic Solutions. Your goal is to identify and rank the top 5 most promising opportunities from the provided data that align with the company's strategic goals.
 
         **Company Profile Context (Primary Guide):**
-        The provided context includes LaTronic Solutions' profile. Pay close attention to their preferred NAICS codes (e.g., 541512, 518210) and preferred areas of work (e.g., Program/Project Management, Cloud Infrastructure). These are the company's goals.
+        The provided context includes LaTronic Solutions' profile. Pay close attention to their preferred NAICS codes (e.g., 541512, 518210), preferred areas of work (e.g., Program/Project Management, Cloud Infrastructure), locations, and award amounts.
 
         **Data Context & User's Question:**
-        The context also includes a list of procurement opportunities. The user's question acts as a mandatory filter on this data.
+        The context also includes a list of procurement opportunities from a data file. The user's question acts as a mandatory filter on this data.
 
         **Your Task (Follow these steps precisely):**
-        1.  **Filter:** First, apply the user's question to find all relevant opportunities.
+        1.  **Filter:** First, apply the user's question to find all relevant opportunities from the data context.
         2.  **Analyze & Score:** From the filtered results, analyze each opportunity against the LaTronic Solutions company profile. An opportunity that aligns with multiple company goals (e.g., a preferred NAICS code AND a preferred area of work) is a higher-value target.
         3.  **Rank:** Select the **Top 5** highest-scoring opportunities. If fewer than 5 match, rank all that do.
-        4.  **Explain & Format:** Present the result as a numbered list. For each of the top 5, provide a clear, concise explanation for its ranking. State exactly which company goals it aligns with. For example: "Ranks #1 because it falls under our primary NAICS code 541512 and is in our preferred 'Cloud Services' area, and a concise description on what is this opportunity about."
+        4.  **Format Output:** Present the result **only** as a Markdown table. Do not include any text or explanations before or after the table. The table must have these exact columns: `Identifier`, `NAICS Code`, `Description`, `Award Amount`, `Expiration Date`, `Location`, `Ranking Explanation`.
+
+            - **Identifier**: Use the Contract ID, Solicitation ID, or another unique identifier from the source data.
+            - **NAICS Code**: Provide the 6-digit code. If it's not available, use 'N/A'.
+            - **Description**: Provide a concise summary of the opportunity's title or scope.
+            - **Award Amount**: State the estimated value or ceiling. If not available, use 'N/A'.
+            - **Expiration Date**: Provide the closing or response date. If not available, use 'N/A'.
+            - **Location**: Specify the place of performance. If not available, use 'N/A'.
+            - **Ranking Explanation**: Briefly explain *why* this opportunity is a good fit, referencing specific company profile goals it aligns with (e.g., "Aligns with NAICS 541512 and preferred location.").
 
         ---
         **Context:**
@@ -223,19 +302,25 @@ def process_file_with_rag(file, file_type, user_prompt, output_format):
     response = retrieval_chain.invoke({"input": user_prompt})
     answer = response["answer"]
     
+    # Parse the Markdown table answer into a DataFrame
+    parsed_df = parse_markdown_table_to_df(answer)
+    # --- PARSING LOGIC CHANGE END ---
+    
     output_filename = f"processed_output.{output_format.lower()}"
     if output_format == "CSV":
-        pd.DataFrame([{"Prompt": user_prompt, "Answer": answer}]).to_csv(output_filename, index=False)
+        parsed_df.to_csv(output_filename, index=False)
     elif output_format == "Excel":
-        pd.DataFrame([{"Prompt": user_prompt, "Answer": answer}]).to_excel(output_filename, index=False)
+        parsed_df.to_excel(output_filename, index=False)
     else: # PDF
         pdf = FPDF()
         pdf.add_page()
         pdf.set_font("Arial", size=12)
+        # The 'answer' for the PDF will be the clean Markdown table
         pdf.multi_cell(0, 10, f"Prompt:\n{user_prompt}\n\nAnswer:\n{answer}")
         pdf.output(output_filename)
         
-    return output_filename, answer
+    # Return the filename, the raw answer, and the parsed DataFrame
+    return output_filename, answer, parsed_df
 
 # --- UI LAYOUT ---
 st.set_page_config(page_title="LaTronic Document Processor", layout="wide")
@@ -337,7 +422,7 @@ if rag_file is not None:
     future_date_str = three_months_later.strftime("%Y-%m-%d")
 
     sample_questions = [
-        "Please analyze all available opportunities."
+    "Analyze all available opportunities and identify the top 5 best matches for our company."
     ]
     st.markdown("**Click a sample question to use it:**")
     cols = st.columns(len(sample_questions))
@@ -359,20 +444,29 @@ if rag_file is not None:
         if not st.session_state.prompt_input:
             st.error("❌ Please enter a question in Step 1.")
         else:
-            with st.spinner("🤖 Processing your file with AI..."):
+            with st.spinner("🤖 Processing your file ..."):
                 try:
+                    # --- CHANGE START ---
                     file_type = rag_file.name.split('.')[-1]
-                    output_path, result_df = process_file_with_rag(
+                    # Expect three return values now: path, raw_answer, and the dataframe
+                    output_path, raw_answer, result_df = process_file_with_rag(
                         file=rag_file,
                         file_type=file_type,
                         user_prompt=st.session_state.prompt_input,
                         output_format=file_format
                     )
-                    st.success(f"✅ Analysis complete! Found {len(result_df)} matching rows.")
-                    with st.expander("📄 View Filtered Data", expanded=True):
-                        st.dataframe(result_df)
-                    with open(output_path, "rb") as f:
-                        st.download_button("⬇️ Download Result", data=f, file_name=output_path)
+                    
+                    if not result_df.empty:
+                        st.success(f"✅ Analysis complete! Found {len(result_df)} matching opportunities.")
+                        with st.expander("📄 View Results Table", expanded=True):
+                            st.dataframe(result_df) # This now receives a valid DataFrame
+                        with open(output_path, "rb") as f:
+                            st.download_button("⬇️ Download Result", data=f, file_name=output_path)
+                    else:
+                        st.warning("⚠️ Analysis complete, but could not parse the output into a table. Displaying raw text.")
+                        st.markdown(raw_answer)
+
+                    # --- CHANGE END ---
                 except Exception as e:
                     logging.error("Error during RAG processing", exc_info=True)
                     st.error(f"An error occurred: {str(e)}")
