@@ -10,3 +10,6 @@ openai
 fpdf2
 fpdf
 tenacity
+pyjwt
+authlib
+python-dotenv
