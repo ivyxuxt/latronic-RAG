@@ -613,7 +613,7 @@ def answer_follow_up_question(previous_results_text: str, follow_up_question: st
     return response.content
 
 # --- UI LAYOUT ---
-# st.set_page_config(page_title="LaTronic Document Processor", layout="wide")
+st.set_page_config(page_title="LaTronic Document Processor", layout="wide")
 st.title("📁 LaTronic Solutions Business Development Processor")
 
 st.info(
